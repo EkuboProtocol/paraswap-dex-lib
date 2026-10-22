@@ -12,6 +12,7 @@ import { DummyDexHelper, IDexHelper } from '../../dex-helper/index';
 import {
   BOOSTED_FEES_CONCENTRATED_ADDRESS,
   DEX_KEY,
+  MEV_CAPTURE_V21_ADDRESS,
   EKUBO_V3_CONFIG,
   EkuboSupportedNetwork,
   TWAMM_ADDRESS,
@@ -37,6 +38,7 @@ import { EkuboV3PoolManager, EVENT_EMITTERS } from './ekubo-v3-pool-manager';
 import { EkuboContracts } from './types';
 import { Logger, Token } from '../../types';
 import { BoostedFeesPool } from './pools/boosted-fees';
+import { MevCaptureV21Pool } from './pools/mev-capture-v21';
 
 jest.setTimeout(50 * 1000);
 
@@ -204,10 +206,22 @@ const eventFixtures: Record<
       ),
     );
 
+    const mevCaptureV21EthUsdcPoolKey = new PoolKey(
+      NATIVE_TOKEN_ADDRESS,
+      USDC,
+      new PoolConfig(
+        BigInt(MEV_CAPTURE_V21_ADDRESS),
+        9223372036854775n,
+        new ConcentratedPoolTypeConfig(1000),
+      ),
+    );
+
     return {
       poolStateEvents: {
         Swapped: [
           [newPool(ConcentratedPool, clEthUsdcPoolKey), 24175246], // https://etherscan.io/tx/0xee56e1f3bad803bd857fb118e55d7eabb5368a94ae8f11e83724278f474294ca
+          // Six Core calls of one forwarded swap, the first of its timestamp (anchor update) https://etherscan.io/tx/0x8c4c162aa18bdb98ca0159f0dacaa2ba4a6af6d934c1a9709e648f26beca7281
+          [newPool(MevCaptureV21Pool, mevCaptureV21EthUsdcPoolKey), 26249544],
           [newPool(TwammPool, twammEthUsdcPoolKey), 24175264], // https://etherscan.io/tx/0x01c02e32ac563e3a761382cb8ef278cfed9ed9dc758b5a95f38dd44978e87b2e
         ],
         PositionUpdated: [
@@ -215,6 +229,7 @@ const eventFixtures: Record<
           [newPool(ConcentratedPool, clEthUsdcPoolKey), 24169222], // Withdraw liquidity https://etherscan.io/tx/0x00cfe35092d58aab347abc58345878092f87d37c7f0f0126fb1c890c791cdc02
           [newPool(TwammPool, twammEthUsdcPoolKey), 24169228], // Add liquidity https://etherscan.io/tx/0x5fceec2c8fce56c7a73b8e3efca77f9ef8561b40a08b05785e9084cba684b5f8
           [newPool(TwammPool, twammEthUsdcPoolKey), 24169235], // Withdraw liquidity https://etherscan.io/tx/0x920f865071397a145e2e9558dfaedb7e138456d8fe43c1899187778a16b00c8b
+          [newPool(MevCaptureV21Pool, mevCaptureV21EthUsdcPoolKey), 26249557], // Withdraw liquidity https://etherscan.io/tx/0xcbf63dcb66a29c7a801d6d430ed9bb0e3d39e8c80b18d9eb9a54a316b0feb5a0
         ],
         OrderUpdated: [
           [newPool(TwammPool, twammEthUsdcPoolKey), 24169245], // Create order https://etherscan.io/tx/0x67bb5ba44397d8b9d9ffe753e9c7f1b478eadfac22464a39521bdd3541f6a68f

@@ -134,7 +134,13 @@ jest.setTimeout(300 * 1000);
 
     beforeAll(async () => {
       snapshot = await provider.send('evm_snapshot', []);
-      [user] = await provider.listAccounts();
+      // an address without code (several well-known test accounts are delegated on mainnet)
+      user = '0x5ed1c0f5e5c0000000000000000000000000beef';
+      await provider.send('anvil_impersonateAccount', [user]);
+      await provider.send('anvil_setBalance', [
+        user,
+        '0x' + (1000n * 10n ** 18n).toString(16),
+      ]);
 
       // Start at the price of the deployed ETH/USDC pilot pool
       const pilotKey = new PoolKey(
@@ -222,6 +228,7 @@ jest.setTimeout(300 * 1000);
       );
       const blockNumber = await provider.getBlockNumber();
       pool.setState(await pool.generateState(blockNumber), blockNumber);
+      pool.isTracking = () => true;
       poolManager.setPool(pool);
     });
 
@@ -229,6 +236,36 @@ jest.setTimeout(300 * 1000);
       await sdk?.releaseResources();
       if (snapshot) await provider.send('evm_revert', [snapshot]);
     });
+
+    // The fetched tick range follows the price, so ticks are compared where both ranges overlap
+    function expectSameState(
+      actual: DeepReadonly<MevCaptureV21PoolState.Object>,
+      expected: DeepReadonly<MevCaptureV21PoolState.Object>,
+    ) {
+      const pick = (x: DeepReadonly<MevCaptureV21PoolState.Object>) => ({
+        sqrtRatio: x.sqrtRatio,
+        liquidity: x.liquidity,
+        activeTick: x.activeTick,
+        config: x.config,
+        anchor: x.anchor,
+        blockTimestamp: x.blockTimestamp,
+      });
+      expect(pick(actual)).toEqual(pick(expected));
+      const low = Math.max(
+        actual.checkedTicksBounds[0],
+        expected.checkedTicksBounds[0],
+      );
+      const high = Math.min(
+        actual.checkedTicksBounds[1],
+        expected.checkedTicksBounds[1],
+      );
+      const inside = (x: DeepReadonly<MevCaptureV21PoolState.Object>) =>
+        MevCaptureV21PoolState.initializedTicks(x).filter(
+          t => t.index > low && t.index < high,
+        );
+      expect(inside(actual)).toEqual(inside(expected));
+      expect(inside(actual).length).toBeGreaterThan(0);
+    }
 
     async function swap(
       srcToken: Token,
@@ -285,13 +322,23 @@ jest.setTimeout(300 * 1000);
         receipt.transactionHash,
         { tracer: 'callTracer' },
       ]);
+      const valueTransfers: string[] = [];
       let forwards = 0;
+      let routerCall: any;
       let routerGas = 0;
       const walk = (frame: any) => {
         const to = (frame.to ?? '').toLowerCase();
-        if (to === YUL_ROUTER_ADDRESS.toLowerCase() && frame.type === 'CALL')
-          routerGas += parseInt(frame.gasUsed, 16);
+        if (
+          to === YUL_ROUTER_ADDRESS.toLowerCase() &&
+          frame.from.toLowerCase() !== CORE_ADDRESS.toLowerCase() &&
+          routerCall === undefined
+        ) {
+          routerCall = frame;
+          routerGas = parseInt(frame.gasUsed, 16);
+        }
         if (to === MEV_CAPTURE_V21_ADDRESS.toLowerCase()) forwards++;
+        if (frame.value && BigInt(frame.value) > 0n)
+          valueTransfers.push(`${frame.from}->${to}:${BigInt(frame.value)}`);
         for (const call of frame.calls ?? []) walk(call);
       };
       walk(trace);
@@ -309,6 +356,11 @@ jest.setTimeout(300 * 1000);
           gasEstimate: quote.gasConsumed,
           routerGas,
           error: receipt.status === 1 ? undefined : trace.error,
+          routerInputBytes: routerCall
+            ? (routerCall.input.length - 2) / 2
+            : undefined,
+          routerError: routerCall?.error,
+          routerOutput: routerCall?.output,
         }),
       );
 
@@ -320,11 +372,40 @@ jest.setTimeout(300 * 1000);
       // The state after the block's logs is the state read from the chain
       const logs = await processBlock(receipt.blockNumber);
       expect(logs.length).toBeGreaterThan(0);
-      expect(pool.getState(receipt.blockNumber)).toEqual(
+      expectSameState(
+        pool.getState(receipt.blockNumber)!,
         await pool.generateState(receipt.blockNumber),
       );
 
       return { quote, routerGas };
+    }
+
+    // A route split over two branches of the same pool runs on Executor02
+    async function splitSwap(srcToken: Token, destToken: Token, amount: bigint) {
+      const priceRoute = await sdk.getPrices(
+        srcToken,
+        destToken,
+        amount,
+        SwapSide.SELL,
+        ContractMethod.swapExactAmountIn,
+        { [DEX_KEY]: [poolKey.stringId] },
+      );
+      const swapStep = priceRoute.bestRoute[0].swaps[0];
+      const [exchange] = swapStep.swapExchanges;
+      const half = amount / 2n;
+      swapStep.swapExchanges = [half, amount - half].map(srcAmount => ({
+        ...exchange,
+        srcAmount: srcAmount.toString(),
+        destAmount: (
+          (BigInt(exchange.destAmount) * srcAmount) /
+          amount
+        ).toString(),
+        percent: 50,
+      }));
+      const tx = await sdk.buildTransaction(priceRoute, 1n, user);
+      const receipt = await send(tx.to, tx.data, BigInt(tx.value ?? '0'));
+      await processBlock(receipt.blockNumber);
+      return receipt.status;
     }
 
     const kinds = (q: { swap: { calls: { kind: { kind: string } }[] } }) =>
@@ -354,6 +435,14 @@ jest.setTimeout(300 * 1000);
     test('SELL USDC -> ETH toward the anchor only', async () => {
       const { quote } = await swap(USDC, ETH, 1_000n * 10n ** 6n, SwapSide.SELL);
       expect(kinds(quote)).toEqual(['toward']);
+    });
+
+    test('SELL split over two branches, USDC -> ETH', async () => {
+      expect(await splitSwap(USDC, ETH, 2_000n * 10n ** 6n)).toBe(1);
+    });
+
+    test('SELL split over two branches, ETH -> USDC', async () => {
+      expect(await splitSwap(ETH, USDC, 10n ** 18n)).toBe(1);
     });
 
     test('BUY ETH with USDC', async () => {
