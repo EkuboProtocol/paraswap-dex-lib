@@ -46,7 +46,9 @@ export type EkuboContract = {
 export type EkuboContracts = Record<
   'core' | 'twamm' | 'boostedFees',
   EkuboContract
->;
+> & {
+  mevCaptureV21: Omit<EkuboContract, 'quoteDataFetcher'>;
+};
 
 export type BoostedFeesQuoteData = {
   sqrtRatio: BigNumber;

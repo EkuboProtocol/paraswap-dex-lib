@@ -12,10 +12,12 @@ import TwammDataFetcherABI from '../../abi/ekubo-v3/twamm-data-fetcher.json';
 import TwammABI from '../../abi/ekubo-v3/twamm.json';
 import BoostedFeesDataFetcherABI from '../../abi/ekubo-v3/boosted-fees-data-fetcher.json';
 import BoostedFeesABI from '../../abi/ekubo-v3/boosted-fees.json';
+import MevCaptureV21ABI from '../../abi/ekubo-v3/mev-capture-v21.json';
 import {
   BOOSTED_FEES_CONCENTRATED_ADDRESS,
   BOOSTED_FEES_DATA_FETCHER_ADDRESS,
   CORE_ADDRESS,
+  MEV_CAPTURE_V21_ADDRESS,
   QUOTE_DATA_FETCHER_ADDRESS,
   TWAMM_ADDRESS,
   TWAMM_DATA_FETCHER_ADDRESS,
@@ -76,6 +78,14 @@ export function ekuboContracts(provider: Provider): EkuboContracts {
         BoostedFeesDataFetcherABI,
         provider,
       ),
+    },
+    mevCaptureV21: {
+      contract: new Contract(
+        MEV_CAPTURE_V21_ADDRESS,
+        MevCaptureV21ABI,
+        provider,
+      ),
+      interface: new Interface(MevCaptureV21ABI),
     },
   };
 }

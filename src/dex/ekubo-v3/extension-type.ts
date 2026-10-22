@@ -1,6 +1,7 @@
 import {
   BOOSTED_FEES_CONCENTRATED_ADDRESS,
   MEV_CAPTURE_ADDRESS,
+  MEV_CAPTURE_V21_ADDRESS,
   ORACLE_ADDRESS,
   TWAMM_ADDRESS,
 } from './config';
@@ -12,12 +13,14 @@ export const enum ExtensionType {
   Twamm,
   MevCapture,
   BoostedFeesConcentrated,
+  MevCaptureV21,
 }
 
 const KNOWN_EXTENSION_TYPES = new Map<bigint, ExtensionType>([
   [BigInt(ORACLE_ADDRESS), ExtensionType.Oracle],
   [BigInt(TWAMM_ADDRESS), ExtensionType.Twamm],
   [BigInt(MEV_CAPTURE_ADDRESS), ExtensionType.MevCapture],
+  [BigInt(MEV_CAPTURE_V21_ADDRESS), ExtensionType.MevCaptureV21],
   [
     BigInt(BOOSTED_FEES_CONCENTRATED_ADDRESS),
     ExtensionType.BoostedFeesConcentrated,

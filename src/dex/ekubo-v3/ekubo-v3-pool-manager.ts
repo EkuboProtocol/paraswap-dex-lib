@@ -21,6 +21,7 @@ import {
   BOOSTED_FEES_CONCENTRATED_ADDRESS,
   CORE_ADDRESS,
   MEV_CAPTURE_ADDRESS,
+  MEV_CAPTURE_V21_ADDRESS,
   ORACLE_ADDRESS,
   TWAMM_ADDRESS,
 } from './config';
@@ -29,6 +30,10 @@ import { StableswapPool } from './pools/stableswap';
 import { ConcentratedPool, ConcentratedPoolState } from './pools/concentrated';
 import { OraclePool } from './pools/oracle';
 import { MevCapturePool } from './pools/mev-capture';
+import {
+  MevCaptureV21Pool,
+  MevCaptureV21PoolState,
+} from './pools/mev-capture-v21';
 import { TwammPool, TwammPoolState } from './pools/twamm';
 import { BoostedFeesPool, BoostedFeesPoolState } from './pools/boosted-fees';
 import { ExtensionType, extensionType } from './extension-type';
@@ -37,6 +42,7 @@ export const EVENT_EMITTERS = [
   CORE_ADDRESS,
   TWAMM_ADDRESS,
   BOOSTED_FEES_CONCENTRATED_ADDRESS,
+  MEV_CAPTURE_V21_ADDRESS,
 ];
 
 const SUBGRAPH_PAGE_SIZE = 1000;
@@ -45,6 +51,7 @@ const SUBGRAPH_EXTENSIONS = [
   TWAMM_ADDRESS,
   MEV_CAPTURE_ADDRESS,
   BOOSTED_FEES_CONCENTRATED_ADDRESS,
+  MEV_CAPTURE_V21_ADDRESS,
 ];
 const SUBGRAPH_QUERY = `query ($lastId: Bytes!) {
   _meta {
@@ -132,7 +139,7 @@ export class EkuboV3PoolManager implements EventSubscriber {
 
   private readonly poolIdParsers: Record<
     string,
-    Map<string, (data: string) => bigint | string>
+    Map<string, (log: Readonly<Log>) => bigint | string>
   >;
   private readonly poolInitializedFragment;
   private readonly poolInitializedTopicHash;
@@ -151,6 +158,10 @@ export class EkuboV3PoolManager implements EventSubscriber {
         contract: boostedFeesContract,
         interface: boostedFeesIface,
       },
+      mevCaptureV21: {
+        contract: mevCaptureV21Contract,
+        interface: mevCaptureV21Iface,
+      },
     } = contracts;
 
     this.poolInitializedFragment = coreIface.getEvent('PoolInitialized');
@@ -166,12 +177,12 @@ export class EkuboV3PoolManager implements EventSubscriber {
       ]),
       [twammContract.address]: new Map<
         string,
-        (data: string) => bigint | string
+        (log: Readonly<Log>) => bigint | string
       >([
         ['', parsePoolIdByLogDataOffsetFn(0)],
         [
           twammIface.getEventTopic('OrderUpdated'),
-          data =>
+          ({ data }) =>
             new PoolKey(
               BigInt(hexDataSlice(data, 64, 96)),
               BigInt(hexDataSlice(data, 96, 128)),
@@ -188,6 +199,12 @@ export class EkuboV3PoolManager implements EventSubscriber {
         [
           boostedFeesIface.getEventTopic('PoolBoosted'),
           parsePoolIdByLogDataOffsetFn(0),
+        ],
+      ]),
+      [mevCaptureV21Contract.address]: new Map([
+        [
+          mevCaptureV21Iface.getEventTopic('AnchorGateFailed'),
+          log => BigInt(log.topics[1]),
         ],
       ]),
     };
@@ -210,7 +227,7 @@ export class EkuboV3PoolManager implements EventSubscriber {
       const poolIdParser = contractParsers.get(eventId);
 
       if (typeof poolIdParser !== 'undefined') {
-        const poolId = poolIdParser(log.data);
+        const poolId = poolIdParser(log);
 
         const pool =
           typeof poolId === 'bigint'
@@ -500,6 +517,9 @@ export class EkuboV3PoolManager implements EventSubscriber {
       this.clearPools();
     }
 
+    const mevCaptureV21PoolKeys: PoolKeyWithInitBlockNumber<ConcentratedPoolTypeConfig>[] =
+      [];
+
     const [twammPoolKeys, boostedFeesPoolKeys, otherPoolKeys] = poolKeys.reduce<
       [
         PoolKeyWithInitBlockNumber<StableswapPoolTypeConfig>[],
@@ -525,6 +545,13 @@ export class EkuboV3PoolManager implements EventSubscriber {
             boostedFeesPoolKeys.push(
               poolKeyWithInitBlockNumber as PoolKeyWithInitBlockNumber<ConcentratedPoolTypeConfig>,
             );
+            break;
+          case ExtensionType.MevCaptureV21:
+            if (isConcentratedKey(poolKeyWithInitBlockNumber.key)) {
+              mevCaptureV21PoolKeys.push(
+                poolKeyWithInitBlockNumber as PoolKeyWithInitBlockNumber<ConcentratedPoolTypeConfig>,
+              );
+            }
             break;
           case ExtensionType.NoSwapCallPoints:
           case ExtensionType.Oracle:
@@ -689,6 +716,21 @@ export class EkuboV3PoolManager implements EventSubscriber {
             TwammPoolState.Object,
             TwammPool
           >(TwammPool, undefined, initBlockNumber, key);
+        } catch (err) {
+          this.logger.error(`Failed to construct pool ${key.stringId}: ${err}`);
+        }
+      }),
+    );
+
+    promises.push(
+      ...mevCaptureV21PoolKeys.map(async ({ key, initBlockNumber }) => {
+        // The state includes the extension's anchor and configuration, which `generateState` reads
+        try {
+          await addPool<
+            ConcentratedPoolTypeConfig,
+            MevCaptureV21PoolState.Object,
+            MevCaptureV21Pool
+          >(MevCaptureV21Pool, undefined, initBlockNumber, key);
         } catch (err) {
           this.logger.error(`Failed to construct pool ${key.stringId}: ${err}`);
         }
@@ -906,6 +948,18 @@ export class EkuboV3PoolManager implements EventSubscriber {
             poolKey,
             BoostedFeesPoolState.fromPoolInitialization(state),
           );
+        case ExtensionType.MevCaptureV21: {
+          // The state includes the extension's configuration, which has to be read
+          const pool = new MevCaptureV21Pool(...commonArgs, poolKey);
+          pool.isTracking = this.isTracking;
+          this.setPool(pool);
+          pool.updateState(blockNumber).catch(err => {
+            this.logger.error(
+              `Failed to fetch the state of pool ${poolKey.stringId}: ${err}`,
+            );
+          });
+          return;
+        }
         default:
           this.logger.debug(
             `Ignoring unknown pool extension ${hexZeroPad(
@@ -922,6 +976,6 @@ export class EkuboV3PoolManager implements EventSubscriber {
 
 function parsePoolIdByLogDataOffsetFn(
   offset: number,
-): (data: string) => bigint {
-  return data => BigInt(hexDataSlice(data, offset, offset + 32));
+): (log: Readonly<Log>) => bigint {
+  return ({ data }) => BigInt(hexDataSlice(data, offset, offset + 32));
 }

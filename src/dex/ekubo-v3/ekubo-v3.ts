@@ -23,7 +23,12 @@ import {
 } from '../../types';
 import { getBigIntPow, getDexKeysWithNetwork } from '../../utils';
 import { SimpleExchange } from '../simple-exchange';
-import { CORE_ADDRESS, EKUBO_V3_CONFIG, ROUTER_ADDRESS } from './config';
+import {
+  CORE_ADDRESS,
+  EKUBO_V3_CONFIG,
+  ROUTER_ADDRESS,
+  YUL_ROUTER_ADDRESS,
+} from './config';
 import { EkuboData } from './types';
 import {
   convertParaSwapToEkubo,
@@ -33,12 +38,24 @@ import {
 } from './utils';
 
 import { BigNumber } from 'ethers';
-import { concat, zeroPad } from 'ethers/lib/utils';
+import { concat, hexlify, hexZeroPad, zeroPad } from 'ethers/lib/utils';
 import RouterABI from '../../abi/ekubo-v3/mev-capture-router.json';
 import { erc20Iface } from '../../lib/tokens/utils';
 import { EkuboV3PoolManager } from './ekubo-v3-pool-manager';
 import { uint8ToNumber } from '../../lib/decoders';
 import { PoolsWriter, toReserves } from '../../lib/pools-storage';
+import { ExtensionType, extensionType } from './extension-type';
+import {
+  encodeForwardedSwapRoute,
+  YUL_ROUTE_SPECIFIED_AMOUNT_OFFSET,
+} from './yul-router';
+
+function isForwardOnly(data: EkuboData): boolean {
+  return (
+    extensionType(BigInt(data.poolKeyAbi.config) >> 96n) ===
+    ExtensionType.MevCaptureV21
+  );
+}
 
 // Storage descriptor: `k` is the pool's string id and the hash field.
 type EkuboPoolDescriptor = { k: string; t0: Address; t1: Address };
@@ -215,8 +232,8 @@ export class EkuboV3 extends SimpleExchange implements IDex<EkuboData> {
   }
 
   public getDexParam(
-    _srcToken: Address,
-    _destToken: Address,
+    srcToken: Address,
+    destToken: Address,
     srcAmount: NumberAsString,
     destAmount: NumberAsString,
     recipient: Address,
@@ -228,6 +245,35 @@ export class EkuboV3 extends SimpleExchange implements IDex<EkuboData> {
     const amountStr = (
       side === SwapSide.SELL ? srcAmount : destAmount
     ).toString();
+
+    if (isForwardOnly(data)) {
+      const [specifiedToken, calculatedToken] = (
+        side === SwapSide.SELL ? [srcToken, destToken] : [destToken, srcToken]
+      ).map(convertParaSwapToEkubo);
+
+      return {
+        needWrapNative: this.needWrapNative,
+        exchangeData: encodeForwardedSwapRoute({
+          specifiedToken,
+          calculatedToken,
+          specifiedAmount: amount,
+          recipient,
+          poolKey: data.poolKeyAbi,
+          forwardee: hexZeroPad(
+            hexlify(BigInt(data.poolKeyAbi.config) >> 96n),
+            20,
+          ),
+          skipAhead: data.skipAhead[amountStr] ?? 0,
+        }),
+        sendEthButSupportsInsertFromAmount: true,
+        targetExchange: YUL_ROUTER_ADDRESS,
+        dexFuncHasRecipient: true,
+        returnAmountPos: undefined,
+        amountsPacked128: true,
+        // the executor writes the amount into the low half of this word
+        insertFromAmountPos: YUL_ROUTE_SPECIFIED_AMOUNT_OFFSET - 16,
+      };
+    }
 
     const isToken1AndSkipAhead = zeroPad(
       BigNumber.from(data.skipAhead[amountStr] ?? 0).toHexString(),
@@ -436,8 +482,29 @@ export class EkuboV3 extends SimpleExchange implements IDex<EkuboData> {
   }
 
   public getCalldataGasCost(
-    _poolPrices: PoolPrices<EkuboData>,
+    poolPrices: PoolPrices<EkuboData>,
   ): number | number[] {
+    if (isForwardOnly(poolPrices.data)) {
+      // packed Yul router route: header, multi-hop header and one forwarded hop
+      return (
+        CALLDATA_GAS_COST.DEX_OVERHEAD +
+        // flags, counts, hop type
+        CALLDATA_GAS_COST.NONZERO_BYTE * 2 +
+        CALLDATA_GAS_COST.ZERO_BYTE * 2 +
+        // specified, calculated, recipient, forwardee, token0, token1 (packed)
+        CALLDATA_GAS_COST.NONZERO_BYTE * 20 * 6 +
+        // unbounded threshold and the default sqrt ratio limit
+        CALLDATA_GAS_COST.ZERO_BYTE * (16 + 12) +
+        // specified amount (int128)
+        CALLDATA_GAS_COST.NONZERO_BYTE * 10 +
+        CALLDATA_GAS_COST.ZERO_BYTE * 6 +
+        // pool config
+        CALLDATA_GAS_COST.FULL_WORD +
+        // skip ahead and partial fill flag
+        CALLDATA_GAS_COST.NONZERO_BYTE * 4
+      );
+    }
+
     // swapAllowPartialFill((address,address,bytes32),bytes32,address)
     return (
       CALLDATA_GAS_COST.DEX_OVERHEAD +
